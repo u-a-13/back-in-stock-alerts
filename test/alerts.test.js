@@ -31,14 +31,16 @@ async function waitFor(fn, what, timeoutMs = 4000) {
   }
 }
 
-// A fake store behaving like the challenge harness: stock lookups fall back
-// to the upper-cased SKU, emails are validated like Resend (422 when a
-// required field is missing) and deduplicated by Idempotency-Key. Every POST
-// is recorded, including the ones the key deduplicated.
+// A fake store behaving like the challenge harness and real Resend: stock
+// lookups fall back to the upper-cased SKU; emails are validated (422 when a
+// required field is missing) and deduplicated by Idempotency-Key, and, like
+// real Resend, the same key with a DIFFERENT payload is a 409. Every POST is
+// recorded, including the ones the key deduplicated. `hangAfterAccept` accepts
+// an email and never answers: a process that dies there has sent it.
 function fakeUpstream() {
   const state = {
     stock: {}, inStockOverride: {}, stockDown: false, stockDelayMs: 0, stockChecks: [],
-    posts: [], emails: [], dedupeHits: 0, failFor: {}, rejectFor: new Set(), emailDelayMs: 0,
+    posts: [], emails: [], dedupeHits: 0, conflicts: 0, failFor: {}, rejectFor: new Set(), hangAfterAccept: new Set(), emailDelayMs: 0,
   };
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -60,7 +62,7 @@ function fakeUpstream() {
       const body = JSON.parse(raw);
       const key = req.headers['idempotency-key'] || null;
       const to = (Array.isArray(body.to) ? body.to : [body.to]).filter(Boolean);
-      const post = { key, to: to[0], status: 0 };
+      const post = { key, to: to[0], status: 0, raw };
       state.posts.push(post);
       const missing = ['from', 'subject'].filter((f) => !body[f]);
       if (!to.length) missing.push('to');
@@ -68,10 +70,12 @@ function fakeUpstream() {
       if (missing.length) { post.status = 422; return send(422, { message: `Missing ${missing.join(', ')}` }); }
       if (state.rejectFor.has(to[0])) { post.status = 422; return send(422, { message: 'invalid recipient' }); }
       const prev = key && state.emails.find((e) => e.key === key);
+      if (prev && prev.raw !== raw) { state.conflicts++; post.status = 409; return send(409, { name: 'invalid_idempotent_request', message: 'Same idempotency key, different payload' }); }
       if (prev) { state.dedupeHits++; post.status = 200; return send(200, { id: prev.id }); }
       if (state.failFor[to[0]] > 0) { state.failFor[to[0]]--; post.status = 500; return send(500, { message: 'injected' }); }
-      const e = { id: `em_${state.emails.length + 1}`, key, ...body, to: to[0] };
+      const e = { id: `em_${state.emails.length + 1}`, key, raw, ...body, to: to[0] };
       state.emails.push(e);
+      if (state.hangAfterAccept.has(to[0])) { post.status = 'accepted, no answer'; return; }
       post.status = 200;
       return send(200, { id: e.id });
     }
@@ -79,7 +83,7 @@ function fakeUpstream() {
   });
   return new Promise((resolve) => server.listen(0, () => resolve({
     state, server, url: `http://127.0.0.1:${server.address().port}`,
-    close: () => new Promise((r) => server.close(r)),
+    close: () => new Promise((r) => { server.closeAllConnections(); server.close(r); }),
   })));
 }
 
@@ -106,15 +110,15 @@ async function setup({ dataDir = ':memory:', upstream, config: extra = {} } = {}
   const outcome = (eventId) => store.db.prepare('SELECT outcome FROM webhook_events WHERE event_id = ?').get(eventId)?.outcome;
   const statusOf = (id) => store.getRequest(id).status;
   let closed = false;
-  async function close({ keepUpstream = false } = {}) {
+  async function close({ keepUpstream = false, crash = false } = {}) {
     if (closed) return;
     closed = true;
-    await notifier.stop();
+    if (!crash) await notifier.stop(); // a crash skips the drain, like SIGKILL
     await new Promise((r) => server.close(r));
     store.db.close();
     if (!keepUpstream) await up.close();
   }
-  return { up, store, notifier, clock, base, post, hook, signup, outcome, statusOf, close };
+  return { up, store, notifier, clock, base, post, hook, signup, outcome, statusOf, close, server };
 }
 
 // ------------------------------------------------------------ sign-up
@@ -164,7 +168,7 @@ test('sign-up answers quickly even when the stock API is slow', async (t) => {
   const t0 = Date.now();
   const r = await s.post('/api/requests', { email: 'a@b.co', sku: 'TEE-1' });
   assert.equal(r.status, 201);
-  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0}ms`);
+  assert.ok(Date.now() - t0 < 2000, `took ${Date.now() - t0}ms (cap is 1.5s)`);
 });
 
 // ------------------------------------------------------------ webhooks
@@ -247,6 +251,43 @@ test('R3: concurrent runs for one product are coalesced into one stock check', a
   assert.equal(s.up.state.posts.length, 1);
 });
 
+test('R3: a webhook run that listed a request before the sweep sent it does not send it again', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  const { id } = await s.signup('a@b.co', 'TEE-1');
+  s.up.state.stock['TEE-1'] = 2;
+  s.up.state.failFor['a@b.co'] = 1;
+  await s.notifier.processSku('TEE-1'); // first attempt fails: the request is owed and due after the backoff
+  s.clock.advance(backoffMs(1));
+  s.up.state.stockDelayMs = 100;
+  const run = s.notifier.processSku('TEE-1'); // lists the request, then waits on the stock API
+  const sweep = s.notifier.sweep(); // meanwhile the owed retry claims and sends it
+  await Promise.all([run, sweep]);
+  assert.equal(s.statusOf(id), 'notified');
+  assert.equal(s.up.state.posts.length, 2, 'the failed first attempt, then exactly one retry');
+  assert.equal(s.up.state.dedupeHits, 0);
+});
+
+test('R3: runs for one product coalesce whatever case the SKU arrives in', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  await s.signup('a@b.co', 'mug-1');
+  s.up.state.stockChecks.length = 0;
+  s.up.state.stock['MUG-1'] = 2;
+  s.up.state.stockDelayMs = 50;
+  await Promise.all([s.notifier.processSku('MUG-1'), s.notifier.processSku('mug-1')]);
+  assert.equal(s.up.state.stockChecks.length, 1);
+  assert.equal(s.up.state.posts.length, 1);
+});
+
+test('R5: the sweep checks stock before emailing a customer it has never emailed', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  const { id } = await s.signup('a@b.co', 'TEE-1');
+  s.up.state.stockChecks.length = 0;
+  await s.notifier.sweep(); // still sold out
+  assert.ok(s.up.state.stockChecks.includes('TEE-1'), 'the sweep consulted the stock API');
+  assert.equal(s.up.state.posts.length, 0);
+  assert.equal(s.statusOf(id), 'waiting');
+});
+
 test('R7: a trigger during a run queues a re-run that picks up the new request', async (t) => {
   const s = await setup(); t.after(() => s.close());
   const first = await s.signup('a@b.co', 'TEE-1');
@@ -285,6 +326,25 @@ test('R6: the retry backoff starts at 15s, never decreases, and is capped at one
   for (let i = 1; i < values.length; i++) assert.ok(values[i] >= values[i - 1], `attempt ${i + 1} decreased`);
   assert.ok(values.every((v) => v <= 3_600_000));
   assert.equal(values.at(-1), 3_600_000);
+});
+
+test('R6: the backoff steps are 15s, 1m, 4m, 16m, then hourly', () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6].map(backoffMs), [15_000, 60_000, 240_000, 960_000, 3_600_000, 3_600_000]);
+});
+
+test('R6: each further failure waits longer, because attempts are counted', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  const { id } = await s.signup('a@b.co', 'TEE-1');
+  s.up.state.stock['TEE-1'] = 2;
+  s.up.state.failFor['a@b.co'] = 3;
+  await s.notifier.processSku('TEE-1');
+  for (let n = 1; n <= 3; n++) {
+    const r = s.store.getRequest(id);
+    assert.equal(r.attempts, n);
+    assert.equal(Date.parse(r.next_attempt_at) - s.clock.now().getTime(), backoffMs(n));
+    if (n < 3) { s.clock.advance(backoffMs(n)); await s.notifier.sweep(); }
+  }
+  assert.equal(s.up.state.posts.length, 3);
 });
 
 test('R6: a failed send waits out its backoff, then sends exactly once', async (t) => {
@@ -378,7 +438,7 @@ test('stock API down during a webhook: nothing is sent, nothing is lost', async 
   assert.equal(s.statusOf(id), 'notified');
 });
 
-test('R4+R8: after a crash mid-send, start-up resends with the same key and nobody gets two emails', async (t) => {
+test('R4+R8: a crash after the email API accepted an email: start-up resends the same bytes and nobody gets two', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bis-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const up = await fakeUpstream();
@@ -386,20 +446,23 @@ test('R4+R8: after a crash mid-send, start-up resends with the same key and nobo
   let s = await setup({ dataDir: dir, upstream: up });
   const a = await s.signup('a@b.co', 'TEE-1');
   const z = await s.signup('z@y.co', 'TEE-1');
-  // The crash: the email API accepted a@b.co's email, but the process died
-  // before recording it, so the row is still "sending".
-  assert.equal(s.store.claim(a.id), true);
-  up.state.emails.push({ id: 'em_pre', key: `back-in-stock-request-${a.id}`, to: 'a@b.co' });
-  await s.close({ keepUpstream: true });
+  up.state.stock['TEE-1'] = 1;
+  up.state.hangAfterAccept.add('a@b.co');
+  s.notifier.processSku('TEE-1').catch(() => {}); // dies with the process
+  await waitFor(() => up.state.emails.some((e) => e.to === 'a@b.co'), 'email API accepted a@b.co');
+  await waitFor(() => s.statusOf(z.id) === 'notified', 'z@y.co sent');
+  assert.equal(s.statusOf(a.id), 'sending');
+  await s.close({ keepUpstream: true, crash: true });
 
+  up.state.hangAfterAccept.clear();
+  up.state.stock['TEE-1'] = 0; // and it sold out while the process was down
   s = await setup({ dataDir: dir, upstream: up });
   t.after(() => s.close({ keepUpstream: true }));
-  assert.equal(s.statusOf(a.id), 'sending');
-  up.state.stock['TEE-1'] = 1;
   s.notifier.start();
-  await waitFor(() => s.statusOf(a.id) === 'notified' && s.statusOf(z.id) === 'notified', 'both notified after restart');
+  await waitFor(() => s.statusOf(a.id) === 'notified', 'a@b.co recorded after restart');
   assert.equal(up.state.emails.filter((e) => e.to === 'a@b.co').length, 1);
   assert.equal(up.state.dedupeHits, 1, 'the resend reused the key and was deduplicated');
+  assert.equal(up.state.conflicts, 0, 'same bytes, so no 409');
   assert.equal(up.state.emails.filter((e) => e.to === 'z@y.co').length, 1);
 });
 
@@ -424,6 +487,8 @@ test('M4: admin refuses a missing or wrong password and lists requests with stat
   assert.equal((await fetch(`${s.base}/admin`, { headers: auth('wrong') })).status, 401);
   const done = await s.signup('done@b.co', 'TEE-1');
   await s.signup('wait@b.co', 'MUG-1');
+  await s.signup('bad@b.co', 'TEE-1');
+  s.up.state.rejectFor.add('bad@b.co');
   s.clock.advance(3 * 3_600_000); // so the notified time cannot be mistaken for the requested time
   s.up.state.stock['TEE-1'] = 1;
   await s.notifier.processSku('TEE-1');
@@ -436,6 +501,7 @@ test('M4: admin refuses a missing or wrong password and lists requests with stat
   assert.match(html, /done@b\.co[\s\S]*?Notified/);
   assert.ok(html.includes(notifiedAt.slice(0, 16).replace('T', ' ')), 'notified time shown');
   assert.match(html, /wait@b\.co[\s\S]*?Waiting/);
+  assert.match(html, /bad@b\.co[\s\S]*?Failed/);
 });
 
 test('M1: the embed form can be framed, and its script posts to an endpoint that exists, with or without a trailing slash', async (t) => {
@@ -453,28 +519,92 @@ test('M1: the embed form can be framed, and its script posts to an endpoint that
   }
 });
 
-test('an owed resend after a sell-out does not claim a stock count it cannot know', async (t) => {
+test('R4+R6: every retry sends the same bytes as the first attempt, so the idempotency key never conflicts', async (t) => {
   const s = await setup(); t.after(() => s.close());
   const { id } = await s.signup('a@b.co', 'TEE-1');
   s.up.state.stock['TEE-1'] = 3;
   s.up.state.failFor['a@b.co'] = 1;
   await s.notifier.processSku('TEE-1');
-  s.up.state.stock['TEE-1'] = 0;
+  s.up.state.stock['TEE-1'] = 0; // sold out before the retry: the owed retry skips the stock check
   s.clock.advance(backoffMs(1));
   await s.notifier.sweep();
   assert.equal(s.statusOf(id), 'notified');
-  const [e] = s.up.state.emails;
-  assert.ok(e, 'the owed email was sent');
-  assert.doesNotMatch(e.html, /left</);
-  assert.doesNotMatch(e.text, / left\./);
+  const [first, retry] = s.up.state.posts;
+  assert.ok(first && retry, 'two attempts');
+  assert.equal(retry.raw, first.raw);
+  assert.equal(s.up.state.emails[0].subject, 'Back in stock: Test Tee');
 });
 
-test('a first send with a confirmed low count says how many are left', async (t) => {
+test('M5: the email never states a stock count, which could be stale by the time it is read', async (t) => {
   const s = await setup(); t.after(() => s.close());
   await s.signup('a@b.co', 'TEE-1');
   s.up.state.stock['TEE-1'] = 3;
   await s.notifier.processSku('TEE-1');
   const [e] = s.up.state.emails;
-  assert.match(e.html, /Only 3 left/);
-  assert.match(e.text, /Only 3 left\./);
+  assert.ok(e);
+  assert.doesNotMatch(e.html + e.text, /\b3 left\b/);
+});
+
+test('M5: the email button links back to the page the customer signed up on', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  await s.post('/api/requests', { email: 'a@b.co', sku: 'TEE-1', source_url: 'https://shop.example.com/products/tee-1' });
+  s.up.state.stock['TEE-1'] = 1;
+  await s.notifier.processSku('TEE-1');
+  const [e] = s.up.state.emails;
+  assert.match(e.html, /href="https:\/\/shop\.example\.com\/products\/tee-1"/);
+  assert.match(e.html, /@media \(max-width:600px\)/, 'the phone layout rule is present');
+});
+
+test('M1: the embed opens in its in-stock state when the product is in stock', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  s.up.state.stock['TEE-1'] = 4;
+  const html = await (await fetch(`${s.base}/embed?sku=TEE-1`)).text();
+  assert.match(html, /<div id="ask" class="hide">/);
+  assert.match(html, /Good news: it is in stock now/);
+});
+
+test('M1: the embed page answers quickly even when the stock API is slow', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  s.up.state.stockDelayMs = 5000;
+  const t0 = Date.now();
+  const r = await fetch(`${s.base}/embed?sku=TEE-1`);
+  assert.equal(r.status, 200);
+  assert.ok(Date.now() - t0 < 2500, `took ${Date.now() - t0}ms`);
+});
+
+test('sign-up accepts a 64-character SKU and refuses a 65-character one', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  assert.equal((await s.post('/api/requests', { email: 'a@b.co', sku: 'A'.repeat(64) })).status, 201);
+  assert.equal((await s.post('/api/requests', { email: 'a@b.co', sku: 'A'.repeat(65) })).status, 400);
+});
+
+test('R8: stopping waits for a run that is mid stock check, and that run sends nothing after stop', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  const { id } = await s.signup('a@b.co', 'TEE-1');
+  s.up.state.stock['TEE-1'] = 2;
+  s.up.state.stockDelayMs = 200;
+  let settled = false;
+  const run = s.notifier.processSku('TEE-1').finally(() => { settled = true; });
+  await waitFor(() => s.up.state.stockChecks.includes('TEE-1') || s.up.state.stockDelayMs === 0, 'stock check started', 1000).catch(() => {});
+  await sleep(20);
+  await s.notifier.stop();
+  assert.equal(settled, true, 'stop() resolved only after the run finished');
+  assert.equal(s.up.state.posts.length, 0, 'nothing sent once stopping');
+  assert.equal(s.statusOf(id), 'waiting');
+  await run;
+});
+
+test('R8: stopping waits for a send started by the sweep', async (t) => {
+  const s = await setup(); t.after(() => s.close());
+  const { id } = await s.signup('a@b.co', 'TEE-1');
+  s.up.state.stock['TEE-1'] = 2;
+  s.up.state.failFor['a@b.co'] = 1;
+  await s.notifier.processSku('TEE-1');
+  s.clock.advance(backoffMs(1));
+  s.up.state.emailDelayMs = 200;
+  const sweep = s.notifier.sweep();
+  await waitFor(() => s.statusOf(id) === 'sending', 'owed retry in flight');
+  await s.notifier.stop();
+  assert.equal(s.statusOf(id), 'notified');
+  await sweep;
 });

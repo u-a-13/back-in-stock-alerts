@@ -1,6 +1,8 @@
 'use strict';
 
 // Outbound calls: the stock API (source of truth for stock) and Resend.
+// Pages a person is waiting on use short budgets (catalogue 2s, page checks
+// 1.5s); background work uses the 8s default with one retry.
 // Neither is trusted to be up, fast, or well-formed.
 
 const TIMEOUT_MS = 8000;
@@ -57,7 +59,7 @@ function makeStockClient({ url, key }) {
     async product(sku) {
       if (Date.now() - catalog.at > 10 * 60_000) {
         try {
-          const { res, body } = await request(url, { headers });
+          const { res, body } = await request(url, { headers }, 2000);
           const list = res.ok && body && Array.isArray(body.products) ? body.products : null;
           if (list) catalog = { at: Date.now(), bySku: new Map(list.map((p) => [String(p.sku).toUpperCase(), p])) };
           else catalog.at = Date.now() - 9 * 60_000; // retry in a minute

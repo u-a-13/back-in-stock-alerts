@@ -23,11 +23,12 @@ function renderEmail({ request, product, config }) {
   const price = product ? money(product.price, product.currency || 'GBP') : '';
   const image = safeImage(product && product.image);
   const url = productUrl(request, config);
-  const low = product && product.quantity > 0 && product.quantity <= 10;
   const store = config.storeName;
 
   const subject = `Back in stock: ${name}`;
-  const pre = low ? `Only ${product.quantity} left. You asked us to let you know.` : 'You asked us to let you know, so here it is.';
+  // No stock count: the email is rendered once and resent byte-for-byte, so a
+  // count could be stale by the time it is read.
+  const pre = 'You asked us to let you know, so here it is.';
 
   const button = url
     ? `<tr><td style="padding:8px 32px 0">
@@ -61,7 +62,6 @@ function renderEmail({ request, product, config }) {
           <td style="padding:16px;vertical-align:middle;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif">
             <div style="font:600 17px/1.35 inherit;color:#1f2a24">${esc(name)}</div>
             ${price ? `<div style="margin-top:4px;font:400 15px/1.4 inherit;color:#4d554f">${esc(price)}</div>` : ''}
-            ${low ? `<div style="margin-top:8px;font:600 13px/1.4 inherit;color:#a14b16">Only ${esc(product.quantity)} left</div>` : ''}
             <div style="margin-top:6px;font:400 12px/1.4 ui-monospace,Menlo,Consolas,monospace;color:#8a918b">SKU ${esc(request.sku)}</div>
           </td>
         </tr>
@@ -80,7 +80,6 @@ function renderEmail({ request, product, config }) {
     '',
     'You asked us to email you when this was back in stock. It just came back.',
     price ? `Price: ${price}` : '',
-    low ? `Only ${product.quantity} left.` : '',
     url ? `Shop it now: ${url}` : '',
     '',
     `This is the only email you'll get about this item. You received it because ${request.email} signed up for a restock alert at ${store}.`,

@@ -118,7 +118,7 @@ function makeApp({ store, stock, notifier, config, adminPassword, log = console 
       // Live stock decides which state the form opens in; if the API is slow
       // or down we just show the sign-up form.
       const [product, live] = valid
-        ? await Promise.all([stock.product(sku).catch(() => null), stock.check(sku).catch(() => null)])
+        ? await Promise.all([stock.product(sku).catch(() => null), stock.check(sku, { attempts: 1, timeoutMs: 1500 }).catch(() => null)])
         : [null, null];
       return send(res, 200, renderEmbed({ sku: valid ? sku : '', product: product || (live && live.name ? live : null), inStock: !!(live && live.inStock), accent: url.searchParams.get('accent') }), {
         'content-type': 'text/html; charset=utf-8',

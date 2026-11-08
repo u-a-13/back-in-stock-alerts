@@ -53,13 +53,13 @@ Without Docker: `npm start` with the same variables (Node 22.13 or newer).
 
 1. **One open request per customer per product.** A partial unique index on `(email, sku)` for open requests (SKU compared case-insensitively) is the one guard: the insert is `ON CONFLICT … DO NOTHING`, and asking twice returns the existing request.
 2. **Duplicate webhooks are recognised.** Each `event_id` is stored. A repeat, including two copies arriving at the same moment, is acknowledged and ignored.
-3. **Sending starts with an atomic claim.** A request moves from `waiting` to `sending` with `UPDATE … WHERE status = 'waiting'`. Only one caller can win that, so two webhooks, or a webhook and the sweep, can never both email the same person.
-4. **Every send carries an `Idempotency-Key`** of `back-in-stock-request-{id}`. If the process dies after the email API accepted the email but before the database recorded it, the retry reuses the key and the email API returns the original instead of sending again.
+3. **Sending starts with an atomic claim.** A request moves from `waiting` to `sending` with `UPDATE … WHERE status = 'waiting'`. Only one caller can win that, so two webhooks, a webhook and the sweep, or two sweeps can never both email the same person. Runs for the same product (whatever the SKU's case) are also coalesced, so they don't even race.
+4. **Every send carries an `Idempotency-Key`** of `back-in-stock-request-{id}`, and the email is rendered once, at the first claim, and stored on the request. Every retry (after a 500, a timeout or a crash after the email API accepted it) sends exactly the same bytes under the same key, so the email API returns the original instead of sending again. Real Resend rejects a reused key with a different payload (409); that can't happen here.
 
 **Not zero**
 
-5. **The webhook is a hint, not the truth.** It must have the right secret, and before anyone is emailed the stock API is checked. A webhook claiming a restock the stock API doesn't confirm sends nothing, and the requests keep waiting.
-6. **Failed sends are retried** with backoff (15s, 1m, 4m, 16m, then hourly), and a new webhook during the backoff does not bypass it. A request that a confirmed restock claimed is *owed* its email: its retries skip the stock re-check, so a product selling out again before the retry lands can't leave that customer with zero emails. (An owed email leaves out the "only N left" line, because that count may be stale.) Sends are only given up on when the email API says the email itself is invalid (400/422), and those show as "Failed" in the admin.
+5. **The webhook is a hint, not the truth.** It must have the right secret, and before anyone is first emailed, from a webhook or from the sweep, the stock API is checked. A webhook claiming a restock the stock API doesn't confirm sends nothing, and the requests keep waiting.
+6. **Failed sends are retried** after at least 15s, 1m, 4m, 16m, then hourly (a retry goes out on the first sweep or webhook after its wait), and a new webhook during the wait does not bypass it. A request that a confirmed restock claimed is *owed* its email: its retries resend the stored email without re-checking stock, so a product selling out again before the retry lands can't leave that customer with zero emails. That is also why the email states no stock count: it is sent byte-for-byte as first rendered, so a count could be stale. Sends are only given up on when the email API says the email itself is invalid (400/422), and those show as "Failed" in the admin.
 7. **A sweep catches what webhooks miss.** Every minute, each product with waiting requests is checked against the stock API. That covers lost webhooks, stock API outages during a webhook, and backed-off retries.
 8. **It survives a restart.** Everything is in SQLite (WAL, `synchronous=FULL`, on the `/data` volume). On start-up, requests interrupted mid-send go back to `waiting` and are retried with the same idempotency key. Webhooks are stored before they're acknowledged, and on `SIGTERM` the app finishes in-flight sends before exiting.
 
@@ -68,15 +68,17 @@ Trade-off: a customer the app never got to (the product sold out again before an
 ## Tests
 
 ```bash
-npm test       # 29 tests, about 15s
+npm test       # 40 tests, about 10s
 npm run soak   # ~40s end-to-end run against the real process (SEED=<n> replays a run)
-npm run mutate # ~10 min: breaks each guarantee in turn and checks a test catches it
+npm run mutate # ~7 min: breaks each guarantee in turn and checks the test named for it catches it
 ```
 
-**Every guarantee above has a test that was seen failing when that guarantee was broken.** `test/mutations.json` lists 31 deliberate breakages of the production code: the claim, the idempotency key, the event dedupe, the unique index, the backoff and its law, the sweep's schedule, the release of interrupted sends on boot, the shutdown drain, the email payload, the admin password, the embed form's target and more. `npm run mutate` applies each one, runs the suite, confirms it goes red, and restores the file byte-for-byte. All 31 are caught. 19 of them were named by an independent review of the first version of these tests, which caught none of them.
+**Every guarantee above has a test that was seen failing when that guarantee was broken.** `test/mutations.json` lists 47 deliberate breakages of the production code, each with the test that must catch it: the claim (as a function and where it is used), the idempotency key and the byte-stable resend, the event dedupe, the unique index, the backoff's steps and its growth with attempts, the sweep's stock check and schedule, boot recovery, the shutdown drain, the email payload and links, the admin password and status labels, the embed form's target and in-stock state, the time budgets on pages a person waits for, and more. `npm run mutate` applies each one, runs the suite, confirms THAT test goes red, and restores the file byte-for-byte. All 47 are caught by the test named for them.
+
+Two independent reviews named most of these breakages: 19 in the first round, none of which the first version of the tests caught, and 12 more in the second.
 
 How the tests avoid passing for the wrong reason:
-- **The fakes behave like the real services.** The fake stock API falls back to the upper-cased SKU like the challenge harness does. The fake email API validates the Resend payload (422 when a field is missing), honours `Idempotency-Key`, and records every POST, including the ones it deduplicated, so tests count send *attempts*, not just outcomes.
+- **The fakes behave like the real services.** The fake stock API falls back to the upper-cased SKU like the challenge harness does. The fake email API validates the Resend payload (422 when a field is missing), honours `Idempotency-Key` and, like real Resend, answers a reused key with a different payload with 409. It records every POST, including the ones it deduplicated, so tests count send *attempts*, not just outcomes. It can also accept an email and never answer, so the crash test is a real crash after acceptance, not a hand-built database row.
 - **No fixed sleeps before "nothing happened".** A test that asserts nobody was emailed first waits for that webhook's stored outcome, so it can only pass after the event was actually processed.
 - **The clock is injected.** Backoffs are tested by moving the clock, not by waiting or editing the database.
 - **The real entry points are driven:** `start()` (boot recovery, the boot sweep, the periodic sweep) and `stop()` (the drain), not the functions they call.
@@ -85,4 +87,4 @@ The soak test runs the server as a separate process against a fake store with th
 
 ## What I'd add for production
 
-Postgres instead of SQLite if it runs on more than one instance (the claim becomes `UPDATE … RETURNING` under row locks), a cancel link in the email, rate limiting on `POST /api/requests`, double opt-in where the law requires it, and HMAC-signed webhooks instead of a shared secret header.
+Schema migrations (`PRAGMA user_version`) before the first deploy with real data: today the schema is created fresh. Postgres instead of SQLite if it runs on more than one instance (the claim becomes `UPDATE … RETURNING` under row locks), a cancel link in the email, rate limiting on `POST /api/requests`, double opt-in where the law requires it, and HMAC-signed webhooks instead of a shared secret header.

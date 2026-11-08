@@ -1,6 +1,7 @@
 'use strict';
 
 const { renderEmail } = require('./views');
+const { skuKey } = require('./db');
 
 // Backoff for failed sends: 15s, 1m, 4m, 16m, then hourly. Never gives up on
 // a retryable error, because "zero emails" is a failure too.
@@ -10,22 +11,28 @@ function backoffMs(attempts) {
 
 function makeNotifier({ store, stock, mailer, config, log = console }) {
   const running = new Map(); // sku -> { promise, again }
-  const inFlight = new Set();
+  const work = new Set(); // every run and sweep in progress: what stop() waits for
   let timer = null;
   let stopping = false;
 
-  // `owed`: a confirmed restock claimed this request, so it gets its email even
-  // if the product sells out again before a retry lands.
+  // The claim, the rendering and the save happen in one synchronous step, so
+  // the bytes sent under a request's idempotency key are fixed before the
+  // first network call, and every retry (after a 500, a timeout or a crash)
+  // sends exactly the same bytes. Real Resend answers a reused key with a
+  // different payload with 409.
   async function sendOne(id, product) {
-    if (!store.claim(id, { owed: true })) return 'skipped'; // someone else has it, or it's done
-    const req = store.getRequest(id);
+    if (!store.claim(id)) return 'skipped'; // someone else has it, or it's done
+    let req = store.getRequest(id);
+    if (!req.email_html) {
+      store.saveEmail(id, renderEmail({ request: req, product: product || { sku: req.sku }, config }));
+      req = store.getRequest(id);
+    }
     try {
-      const email = renderEmail({ request: req, product, config });
       const emailId = await mailer.send({
         to: req.email,
-        subject: email.subject,
-        html: email.html,
-        text: email.text,
+        subject: req.email_subject,
+        html: req.email_html,
+        text: req.email_text,
         idempotencyKey: `back-in-stock-request-${req.id}`,
       });
       store.markNotified(id, emailId);
@@ -49,9 +56,7 @@ function makeNotifier({ store, stock, mailer, config, log = console }) {
     const worker = async () => {
       while (queue.length && !stopping) {
         const id = queue.shift();
-        const p = sendOne(id, typeof info === 'function' ? await info(id) : info);
-        inFlight.add(p);
-        try { results[await p]++; } finally { inFlight.delete(p); }
+        results[await sendOne(id, info)]++;
       }
     };
     await Promise.all(Array.from({ length: Math.min(4, ids.length) }, worker));
@@ -81,28 +86,35 @@ function makeNotifier({ store, stock, mailer, config, log = console }) {
 
   // One run per SKU at a time. A trigger during a run queues exactly one re-run.
   function processSku(sku) {
-    const cur = running.get(sku);
+    const key = skuKey(sku);
+    const cur = running.get(key);
     if (cur) { cur.again = true; return cur.promise; }
     const entry = { again: false, promise: null };
     entry.promise = (async () => {
       let outcome;
       try {
         do { entry.again = false; outcome = await runSku(sku); } while (entry.again && !stopping);
-      } finally { running.delete(sku); }
+      } finally { running.delete(key); }
       return outcome;
     })();
-    running.set(sku, entry);
+    running.set(key, entry);
+    track(entry.promise);
     return entry.promise;
+  }
+
+  function track(promise) {
+    work.add(promise);
+    promise.then(() => work.delete(promise), () => work.delete(promise));
+    return promise;
   }
 
   // Safety net for lost webhooks, failed stock checks and failed sends.
   // Owed retries go first and skip the stock check: their restock was confirmed.
-  async function sweep() {
+  const sweep = () => track(sweepOnce());
+  async function sweepOnce() {
+    // Owed requests resend their stored email: no stock check, no product lookup.
     const owed = store.dueOwedIds();
-    if (owed.length) {
-      // No stock count: the cached catalogue's quantity may be stale, and the item may have sold out again.
-      await sendAll(owed, async (id) => ({ ...(await stock.product(store.getRequest(id).sku).catch(() => null)), quantity: undefined }));
-    }
+    if (owed.length) await sendAll(owed, null);
     for (const sku of store.skusWithWaiting()) {
       if (stopping) break;
       await processSku(sku).catch((e) => log.error(`sweep ${sku}: ${e.message}`));
@@ -122,7 +134,9 @@ function makeNotifier({ store, stock, mailer, config, log = console }) {
     async stop() {
       stopping = true;
       clearTimeout(timer);
-      await Promise.race([Promise.allSettled([...inFlight]), new Promise((r) => setTimeout(r, 10_000))]);
+      let limit;
+      await Promise.race([Promise.allSettled([...work]), new Promise((r) => { limit = setTimeout(r, 10_000); })]);
+      clearTimeout(limit);
     },
   };
 }

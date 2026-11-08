@@ -9,6 +9,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
+// One rule for "same SKU": SQLite's NOCASE folds ASCII letters only, so this
+// does exactly the same for in-memory keys (the per-product run map).
+const skuKey = (sku) => String(sku).replace(/[a-z]/g, (c) => c.toUpperCase());
+
 function openDb(dataDir) {
   const file = dataDir === ':memory:' ? ':memory:' : path.join(dataDir, 'alerts.db');
   if (file !== ':memory:') fs.mkdirSync(dataDir, { recursive: true });
@@ -27,7 +31,10 @@ function openDb(dataDir) {
       created_at      TEXT NOT NULL,
       notified_at     TEXT,
       attempts        INTEGER NOT NULL DEFAULT 0,
-      owed_at         TEXT,  -- set once a confirmed restock claimed it: retries no longer re-check stock
+      owed_at         TEXT,  -- set by the first claim (only ever made after a confirmed restock): retries skip the stock check
+      email_subject   TEXT,  -- the email, rendered once at the first claim; every retry sends these exact bytes
+      email_html      TEXT,
+      email_text      TEXT,
       next_attempt_at TEXT,
       last_error      TEXT,
       email_id        TEXT
@@ -71,9 +78,10 @@ function makeStore(db, { clock = () => new Date() } = {}) {
       `SELECT id FROM requests WHERE status = 'waiting' AND owed_at IS NOT NULL
          AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY id`),
     claim: db.prepare(
-      `UPDATE requests SET status = 'sending', attempts = attempts + 1,
-         owed_at = CASE WHEN ? THEN COALESCE(owed_at, ?) ELSE owed_at END
+      `UPDATE requests SET status = 'sending', attempts = attempts + 1, owed_at = COALESCE(owed_at, ?)
          WHERE id = ? AND status = 'waiting'`),
+    saveEmail: db.prepare(
+      `UPDATE requests SET email_subject = ?, email_html = ?, email_text = ? WHERE id = ?`),
     markNotified: db.prepare(
       `UPDATE requests SET status = 'notified', notified_at = ?, email_id = ?, last_error = NULL
          WHERE id = ? AND status = 'sending'`),
@@ -111,9 +119,12 @@ function makeStore(db, { clock = () => new Date() } = {}) {
     dueOwedIds: () => s.dueOwed.all(now()).map((r) => r.id),
     skusWithWaiting: () => s.skusWaiting.all(now()).map((r) => r.sku),
 
-    // The exactly-once gate: only one caller can move a request from
-    // waiting to sending. `owed` records that a confirmed restock claimed it.
-    claim: (id, { owed = false } = {}) => s.claim.run(owed ? 1 : 0, now(), id).changes === 1,
+    // The exactly-once gate: only one caller can move a request from waiting
+    // to sending. A claim is only made after a confirmed restock, so it also
+    // marks the request as owed its email.
+    claim: (id) => s.claim.run(now(), id).changes === 1,
+    // Called once per request, by sendOne, before its first send.
+    saveEmail: (id, { subject, html, text }) => s.saveEmail.run(subject, html, text, id),
     markNotified: (id, emailId) => s.markNotified.run(now(), emailId || null, id),
     markRetry: (id, error, retryAt) => s.markRetry.run(String(error).slice(0, 500), retryAt, id),
     markFailed: (id, error) => s.markFailed.run(String(error).slice(0, 500), id),
@@ -154,4 +165,4 @@ function makeStore(db, { clock = () => new Date() } = {}) {
   };
 }
 
-module.exports = { openDb, makeStore };
+module.exports = { openDb, makeStore, skuKey };
