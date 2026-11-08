@@ -1,0 +1,250 @@
+[
+ {
+  "id": "S1",
+  "what": "admin accepts any password",
+  "file": "src/app.js",
+  "find": "if (pass && safeEqual(pass, adminPassword)) return true;",
+  "replace": "if (pass) return true;",
+  "expect": "kill"
+ },
+ {
+  "id": "S2",
+  "what": "claim is not exclusive",
+  "file": "src/db.js",
+  "find": "WHERE id = ? AND status = 'waiting'`",
+  "replace": "WHERE id = ?`",
+  "expect": "kill"
+ },
+ {
+  "id": "S3",
+  "what": "no per-product coalescing",
+  "file": "src/notifier.js",
+  "find": "if (cur) { cur.again = true; return cur.promise; }",
+  "replace": "if (false) { cur.again = true; return cur.promise; }",
+  "expect": "kill"
+ },
+ {
+  "id": "S4",
+  "what": "no release of interrupted sends on boot",
+  "file": "src/notifier.js",
+  "find": "const released = store.releaseStuck();",
+  "replace": "const released = 0;",
+  "expect": "kill"
+ },
+ {
+  "id": "S5",
+  "what": "no backoff",
+  "file": "src/notifier.js",
+  "find": "Math.min(15_000 * 4 ** Math.max(0, attempts - 1), 60 * 60_000)",
+  "replace": "0",
+  "expect": "kill"
+ },
+ {
+  "id": "S6",
+  "what": "webhook run ignores the backoff",
+  "file": "src/db.js",
+  "find": "next_attempt_at <= ?) ORDER BY id`),\n    skusWaiting",
+  "replace": "next_attempt_at <= ? OR 1) ORDER BY id`),\n    skusWaiting",
+  "expect": "kill"
+ },
+ {
+  "id": "S7",
+  "what": "4xx never permanent",
+  "file": "src/clients.js",
+  "find": "const permanent = res.status === 400 || res.status === 422;",
+  "replace": "const permanent = false;",
+  "expect": "kill"
+ },
+ {
+  "id": "S8",
+  "what": "email missing from/subject/html",
+  "file": "src/clients.js",
+  "find": "body: JSON.stringify({ from, to: [to], subject, html, text }),",
+  "replace": "body: JSON.stringify({ to: [to], text }),",
+  "expect": "kill"
+ },
+ {
+  "id": "S9",
+  "what": "empty subject",
+  "file": "src/views.js",
+  "find": "const subject = `Back in stock: ${name}`;",
+  "replace": "const subject = '';",
+  "expect": "kill"
+ },
+ {
+  "id": "S10",
+  "what": "no unique index",
+  "file": "src/db.js",
+  "find": "CREATE UNIQUE INDEX IF NOT EXISTS requests_one_open",
+  "replace": "CREATE INDEX IF NOT EXISTS requests_one_open",
+  "expect": "kill"
+ },
+ {
+  "id": "S11",
+  "what": "insert ignores the open-request conflict",
+  "file": "src/db.js",
+  "find": "\n         ON CONFLICT (email, sku) WHERE status IN ('waiting','sending') DO NOTHING`",
+  "replace": "`",
+  "expect": "kill"
+ },
+ {
+  "id": "S12",
+  "what": "sign-up fails when the stock API is down",
+  "file": "src/app.js",
+  "find": "log.warn(`${sku}: stock check during sign-up failed, storing request anyway: ${e.message}`);",
+  "replace": "throw e;",
+  "expect": "kill"
+ },
+ {
+  "id": "S13",
+  "what": "no periodic sweep",
+  "file": "src/notifier.js",
+  "find": "const tick = () => { timer = setTimeout(",
+  "replace": "const tick = () => { return; timer = setTimeout(",
+  "expect": "kill"
+ },
+ {
+  "id": "S14",
+  "what": "no queued re-run",
+  "file": "src/notifier.js",
+  "find": "} while (entry.again && !stopping);",
+  "replace": "} while (false);",
+  "expect": "kill"
+ },
+ {
+  "id": "S15",
+  "what": "admin hides the notified time",
+  "file": "src/views.js",
+  "find": "<td class=\"num\">${fmtTime(r.notified_at)}</td>",
+  "replace": "<td class=\"num\"></td>",
+  "expect": "kill"
+ },
+ {
+  "id": "S16",
+  "what": "embed form posts nowhere",
+  "file": "src/views.js",
+  "find": "fetch('/api/requests'",
+  "replace": "fetch('api/nope'",
+  "expect": "kill"
+ },
+ {
+  "id": "S17",
+  "what": "event_id not required",
+  "file": "src/app.js",
+  "find": "if (!SKU_RE.test(sku) || !eventId) return json(res, 400,",
+  "replace": "if (!SKU_RE.test(sku)) return json(res, 400,",
+  "expect": "kill"
+ },
+ {
+  "id": "S18",
+  "what": "ignores the in_stock flag",
+  "file": "src/clients.js",
+  "find": "const inStock = quantity > 0 && body.in_stock !== false;",
+  "replace": "const inStock = quantity > 0;",
+  "expect": "kill"
+ },
+ {
+  "id": "S19",
+  "what": "stop() does not wait for in-flight sends",
+  "file": "src/notifier.js",
+  "find": "inFlight.add(p);",
+  "replace": "",
+  "expect": "kill"
+ },
+ {
+  "id": "K1",
+  "what": "no event dedupe",
+  "file": "src/db.js",
+  "find": "if (r.changes === 1) return true;",
+  "replace": "return true;",
+  "expect": "kill"
+ },
+ {
+  "id": "K2",
+  "what": "idempotency key changes per attempt",
+  "file": "src/notifier.js",
+  "find": "idempotencyKey: `back-in-stock-request-${req.id}`,",
+  "replace": "idempotencyKey: `back-in-stock-request-${req.id}-${req.attempts}`,",
+  "expect": "kill"
+ },
+ {
+  "id": "K3",
+  "what": "every email failure permanent",
+  "file": "src/clients.js",
+  "find": "const permanent = res.status === 400 || res.status === 422;",
+  "replace": "const permanent = true;",
+  "expect": "kill"
+ },
+ {
+  "id": "K4",
+  "what": "trusts the webhook quantity",
+  "file": "src/notifier.js",
+  "find": "if (!product.inStock) return `stock API says",
+  "replace": "if (false) return `stock API says",
+  "expect": "kill"
+ },
+ {
+  "id": "N1",
+  "what": "SKUs case-sensitive",
+  "file": "src/db.js",
+  "find": "sku             TEXT NOT NULL COLLATE NOCASE,",
+  "replace": "sku             TEXT NOT NULL,",
+  "expect": "kill"
+ },
+ {
+  "id": "N2",
+  "what": "claims never marked owed",
+  "file": "src/notifier.js",
+  "find": "if (!store.claim(id, { owed: true }))",
+  "replace": "if (!store.claim(id, { owed: false }))",
+  "expect": "kill"
+ },
+ {
+  "id": "N3",
+  "what": "owed retries never sent",
+  "file": "src/notifier.js",
+  "find": "const owed = store.dueOwedIds();",
+  "replace": "const owed = [];",
+  "expect": "kill"
+ },
+ {
+  "id": "N4",
+  "what": "sign-up waits the full stock timeout",
+  "file": "src/app.js",
+  "find": "const s = await stock.check(sku, { attempts: 1, timeoutMs: 1500 });",
+  "replace": "const s = await stock.check(sku);",
+  "expect": "kill"
+ },
+ {
+  "id": "N5",
+  "what": "owed flag never written",
+  "file": "src/db.js",
+  "find": "owed_at = CASE WHEN ? THEN COALESCE(owed_at, ?) ELSE owed_at END",
+  "replace": "owed_at = owed_at",
+  "expect": "kill"
+ },
+ {
+  "id": "S6b",
+  "what": "owed retry ignores the backoff",
+  "file": "src/db.js",
+  "find": "next_attempt_at <= ?) ORDER BY id`),\n    claim",
+  "replace": "next_attempt_at <= ? OR 1) ORDER BY id`),\n    claim",
+  "expect": "kill"
+ },
+ {
+  "id": "O1",
+  "what": "owed email shows a stale stock count",
+  "file": "src/notifier.js",
+  "find": ", quantity: undefined }));",
+  "replace": " }));",
+  "expect": "kill"
+ },
+ {
+  "id": "O2",
+  "what": "stock count never shown",
+  "file": "src/views.js",
+  "find": "const low = product && product.quantity > 0 && product.quantity <= 10;",
+  "replace": "const low = false;",
+  "expect": "kill"
+ }
+]

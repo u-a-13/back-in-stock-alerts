@@ -52,7 +52,7 @@ function renderEmail({ request, product, config }) {
     <tr><td class="px" style="padding:28px 32px 6px">
       <span style="display:inline-block;padding:5px 10px;border-radius:999px;background:#e3efe6;color:#1d6b3a;font:600 12px/1 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;letter-spacing:.04em;text-transform:uppercase">Back in stock</span>
       <h1 class="h1" style="margin:16px 0 8px;font:700 28px/1.2 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2a24">It's back.</h1>
-      <p style="margin:0;font:400 16px/1.55 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#4d554f">You asked us to email you when this was back in stock. It is, as of right now.</p>
+      <p style="margin:0;font:400 16px/1.55 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#4d554f">You asked us to email you when this was back in stock. It just came back.</p>
     </td></tr>
     <tr><td class="px" style="padding:22px 32px 6px">
       <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border:1px solid #ebe8e1;border-radius:12px">
@@ -78,7 +78,7 @@ function renderEmail({ request, product, config }) {
   const text = [
     `Back in stock: ${name}`,
     '',
-    'You asked us to email you when this was back in stock. It is, as of right now.',
+    'You asked us to email you when this was back in stock. It just came back.',
     price ? `Price: ${price}` : '',
     low ? `Only ${product.quantity} left.` : '',
     url ? `Shop it now: ${url}` : '',
@@ -158,7 +158,7 @@ function renderEmbed({ sku, product, accent, inStock }) {
     if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) { m.className = 'msg bad'; m.textContent = 'Please enter a valid email address.'; f.email.focus(); return; }
     if (!sku) { m.className = 'msg bad'; m.textContent = 'Please enter the product code.'; return; }
     b.disabled = true; b.textContent = 'Saving…';
-    fetch('api/requests', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, sku: sku, source_url: src }) })
+    fetch('/api/requests', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: email, sku: sku, source_url: src }) })
       .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
       .then(function (x) {
         if (!x.ok) throw new Error(x.j && x.j.error || 'Something went wrong.');

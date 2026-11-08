@@ -23,6 +23,7 @@ const config = {
   storeName: process.env.STORE_NAME || 'Our store',
   productUrlTemplate: process.env.PRODUCT_URL_TEMPLATE || '', // e.g. https://shop.example.com/products/{sku}
   sweepSeconds: Number(process.env.SWEEP_INTERVAL_SECONDS) || 60,
+  bootSweepMs: 2000,
 };
 
 function missingRequired() {

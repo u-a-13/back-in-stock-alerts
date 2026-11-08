@@ -5,7 +5,8 @@ const crypto = require('node:crypto');
 const { renderEmbed, renderAdmin } = require('./views');
 
 const EMAIL_RE = /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[^\s@<>()[\]\\,;:"]{2,}$/;
-const SKU_RE = /^[A-Za-z0-9][A-Za-z0-9._\-/]{0,63}$/;
+// 1-64 printable characters, no leading or trailing space (input is trimmed).
+const SKU_RE = /^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]{0,62}[^\s\x00-\x1f\x7f])?$/;
 
 function safeEqual(a, b) {
   const x = crypto.createHash('sha256').update(String(a)).digest();
@@ -57,9 +58,9 @@ function makeApp({ store, stock, notifier, config, adminPassword, log = console 
     if (!SKU_RE.test(sku)) return json(res, 400, { error: 'That product code is not valid.' }, CORS);
 
     // If it's already in stock there's nothing to wait for. If the stock API
-    // is down we store the request anyway: the sweep will sort it out.
+    // is slow or down we store the request anyway: the sweep will sort it out.
     try {
-      const s = await stock.check(sku);
+      const s = await stock.check(sku, { attempts: 1, timeoutMs: 1500 });
       if (s.inStock) {
         return json(res, 200, { status: 'in_stock', sku, quantity: s.quantity }, CORS);
       }

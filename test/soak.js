@@ -9,7 +9,7 @@
 //   2. every notified request has exactly one accepted email
 //   3. every request still waiting is for a product that really is sold out
 //
-//   node test/soak.js            (about 40 seconds)
+//   node test/soak.js            (about 40 seconds; SEED=<n> replays a run)
 
 const http = require('node:http');
 const fs = require('node:fs');
@@ -25,14 +25,23 @@ const stock = Object.fromEntries(SKUS.map((s) => [s, 0]));
 const emails = [];
 let failRate = 0.15;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const pick = (a) => a[Math.floor(Math.random() * a.length)];
+// Seeded, so a failing run can be replayed: SEED=<n> npm run soak
+const SEED = Number(process.env.SEED) || Math.floor(Math.random() * 2 ** 31);
+let seedState = SEED;
+const random = () => { // mulberry32
+  seedState = (seedState + 0x6d2b79f5) | 0;
+  let t = Math.imul(seedState ^ (seedState >>> 15), 1 | seedState);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+const pick = (a) => a[Math.floor(random() * a.length)];
 
 const upstream = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const send = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
   if ((req.headers.authorization || '') !== `Bearer ${KEY}`) return send(401, { message: 'bad key' });
   if (req.method === 'GET' && url.pathname.startsWith('/api/stock')) {
-    if (Math.random() < 0.05) return send(503, { error: 'flaky' }); // don't trust the network
+    if (random() < 0.05) return send(503, { error: 'flaky' }); // don't trust the network
     const sku = decodeURIComponent(url.pathname.slice('/api/stock/'.length));
     if (!sku) return send(200, { products: SKUS.map((s) => ({ sku: s, name: s.toLowerCase(), price: 25, currency: 'GBP', image: `https://picsum.photos/seed/${s}/600/600` })) });
     const q = stock[sku] || 0;
@@ -41,12 +50,12 @@ const upstream = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/emails') {
     let raw = '';
     for await (const c of req) raw += c;
-    await sleep(Math.random() * 80);
+    await sleep(random() * 80);
     const key = req.headers['idempotency-key'];
     const prev = emails.find((e) => e.key === key && e.status === 'accepted');
     if (prev) return send(200, { id: prev.id });
     const body = JSON.parse(raw);
-    if (Math.random() < failRate) { emails.push({ key, to: body.to[0], status: 'failed' }); return send(500, { message: 'injected' }); }
+    if (random() < failRate) { emails.push({ key, to: body.to[0], status: 'failed' }); return send(500, { message: 'injected' }); }
     const e = { id: crypto.randomUUID(), key, to: body.to[0], subject: body.subject, status: 'accepted' };
     emails.push(e);
     return send(200, { id: e.id });
@@ -86,17 +95,17 @@ const hook = (sku, quantity, eventId) => post('/webhooks/stock', { event_id: eve
 const stats = { signups: 0, restocks: 0, doubled: 0, phantoms: 0, sellouts: 0, badSecret: 0 };
 
 async function step() {
-  const roll = Math.random();
+  const roll = random();
   const out = SKUS.filter((s) => !stock[s]);
   if (roll < 0.5) {
-    const sku = Math.random() < 0.85 && out.length ? pick(out) : pick(SKUS);
+    const sku = random() < 0.85 && out.length ? pick(out) : pick(SKUS);
     await post('/api/requests', { email: `${pick(['amira', 'ben', 'chloe', 'dev', 'ella', 'finn'])}.${pick(['khan', 'smith', 'ito'])}@example.com`, sku });
     stats.signups++;
   } else if (roll < 0.72 && out.length) {
     const sku = pick(out);
-    stock[sku] = 1 + Math.floor(Math.random() * 20);
+    stock[sku] = 1 + Math.floor(random() * 20);
     const id = `evt_${crypto.randomBytes(4).toString('hex')}`;
-    const twice = Math.random() < 0.3;
+    const twice = random() < 0.3;
     await Promise.all([hook(sku, stock[sku], id), ...(twice ? [hook(sku, stock[sku], id)] : [])]);
     stats.restocks++; if (twice) stats.doubled++;
   } else if (roll < 0.88) {
@@ -114,7 +123,7 @@ async function step() {
 (async () => {
   await new Promise((r) => upstream.listen(0, r));
   const upstreamUrl = `http://127.0.0.1:${upstream.address().port}`;
-  const port = 3900 + Math.floor(Math.random() * 90);
+  const port = 3900 + Math.floor(random() * 90);
   appUrl = `http://127.0.0.1:${port}`;
   startApp(port, upstreamUrl);
   await waitUp();
@@ -162,6 +171,7 @@ async function step() {
   stats.retriesScheduled = scheduled.length;
   const orphanEmails = [...byKey.keys()].filter((k) => !notified.some((r) => `back-in-stock-request-${r.id}` === k)).length;
 
+  console.log(`Seed: ${SEED}`);
   console.log('Soak run:', JSON.stringify({ ...stats, requests: rows.length, notified: notified.length, waiting: waiting.length,
     emailsAccepted: accepted.length, sendFailuresInjected: emails.filter((e) => e.status === 'failed').length }));
   const checks = [

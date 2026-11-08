@@ -42,8 +42,8 @@ Without Docker: `npm start` with the same variables (Node 22.13 or newer).
   ```html
   <iframe src="https://your-app/embed?sku=MUG-STN-SAGE" style="border:0;width:100%;max-width:460px;height:320px"></iframe>
   ```
-- **`POST /api/requests`** `{ email, sku }`: `201` for a new request, `200` with `already_requested: true` if that email already has an open request for that SKU, `200` with `status: "in_stock"` if there's nothing to wait for, `400` for a bad email or SKU.
-- **`POST /webhooks/stock`**: needs `X-Webhook-Secret`. Returns `202` for a new event, `200` with `duplicate: true` for a repeat, `401` for a wrong secret.
+- **`POST /api/requests`** `{ email, sku }`: `201` for a new request, `200` with `already_requested: true` if that email already has an open request for that SKU, `200` with `status: "in_stock"` if there's nothing to wait for, `400` for a bad email or SKU. SKUs match whatever their case (`mug-1` and `MUG-1` are one product). The in-stock check here is capped at 1.5 seconds; if the stock API is slow or down, the request is stored anyway.
+- **`POST /webhooks/stock`**: needs `X-Webhook-Secret`. Returns `202` for a new event, `200` with `duplicate: true` for a repeat, `401` for a wrong secret, `400` without an `event_id` or `sku`.
 - **`GET /admin`**: HTTP Basic auth (any username, the admin password). Every request with its status, when it was requested and notified, attempts and the last error; filters, search, and the recent webhooks with what each one did.
 - **`GET /healthz`**
 
@@ -51,7 +51,7 @@ Without Docker: `npm start` with the same variables (Node 22.13 or newer).
 
 **Not two**
 
-1. **One open request per customer per product.** A partial unique index on `(email, sku)` for open requests. Asking twice returns the existing request.
+1. **One open request per customer per product.** A partial unique index on `(email, sku)` for open requests (SKU compared case-insensitively) is the one guard: the insert is `ON CONFLICT … DO NOTHING`, and asking twice returns the existing request.
 2. **Duplicate webhooks are recognised.** Each `event_id` is stored. A repeat, including two copies arriving at the same moment, is acknowledged and ignored.
 3. **Sending starts with an atomic claim.** A request moves from `waiting` to `sending` with `UPDATE … WHERE status = 'waiting'`. Only one caller can win that, so two webhooks, or a webhook and the sweep, can never both email the same person.
 4. **Every send carries an `Idempotency-Key`** of `back-in-stock-request-{id}`. If the process dies after the email API accepted the email but before the database recorded it, the retry reuses the key and the email API returns the original instead of sending again.
@@ -59,18 +59,27 @@ Without Docker: `npm start` with the same variables (Node 22.13 or newer).
 **Not zero**
 
 5. **The webhook is a hint, not the truth.** It must have the right secret, and before anyone is emailed the stock API is checked. A webhook claiming a restock the stock API doesn't confirm sends nothing, and the requests keep waiting.
-6. **Failed sends are retried** with backoff (30s, 2m, 8m, 30m, then hourly). They are only given up on when the email API says the email itself is invalid (400/422), and those show as "Failed" in the admin.
+6. **Failed sends are retried** with backoff (15s, 1m, 4m, 16m, then hourly), and a new webhook during the backoff does not bypass it. A request that a confirmed restock claimed is *owed* its email: its retries skip the stock re-check, so a product selling out again before the retry lands can't leave that customer with zero emails. (An owed email leaves out the "only N left" line, because that count may be stale.) Sends are only given up on when the email API says the email itself is invalid (400/422), and those show as "Failed" in the admin.
 7. **A sweep catches what webhooks miss.** Every minute, each product with waiting requests is checked against the stock API. That covers lost webhooks, stock API outages during a webhook, and backed-off retries.
 8. **It survives a restart.** Everything is in SQLite (WAL, `synchronous=FULL`, on the `/data` volume). On start-up, requests interrupted mid-send go back to `waiting` and are retried with the same idempotency key. Webhooks are stored before they're acknowledged, and on `SIGTERM` the app finishes in-flight sends before exiting.
 
-Trade-off: if a product sells out again before the sweep or webhook gets to it, those customers keep waiting for the next restock rather than getting an email for stock that's already gone.
+Trade-off: a customer the app never got to (the product sold out again before any webhook or sweep reached them) keeps waiting for the next restock, rather than getting an email for stock that was already gone.
 
 ## Tests
 
 ```bash
-npm test     # 12 tests: duplicates, concurrency, phantom restocks, failed sends, outages, restart mid-send, auth
-npm run soak # ~40s end-to-end run against the real process
+npm test       # 29 tests, about 15s
+npm run soak   # ~40s end-to-end run against the real process (SEED=<n> replays a run)
+npm run mutate # ~10 min: breaks each guarantee in turn and checks a test catches it
 ```
+
+**Every guarantee above has a test that was seen failing when that guarantee was broken.** `test/mutations.json` lists 31 deliberate breakages of the production code: the claim, the idempotency key, the event dedupe, the unique index, the backoff and its law, the sweep's schedule, the release of interrupted sends on boot, the shutdown drain, the email payload, the admin password, the embed form's target and more. `npm run mutate` applies each one, runs the suite, confirms it goes red, and restores the file byte-for-byte. All 31 are caught. 19 of them were named by an independent review of the first version of these tests, which caught none of them.
+
+How the tests avoid passing for the wrong reason:
+- **The fakes behave like the real services.** The fake stock API falls back to the upper-cased SKU like the challenge harness does. The fake email API validates the Resend payload (422 when a field is missing), honours `Idempotency-Key`, and records every POST, including the ones it deduplicated, so tests count send *attempts*, not just outcomes.
+- **No fixed sleeps before "nothing happened".** A test that asserts nobody was emailed first waits for that webhook's stored outcome, so it can only pass after the event was actually processed.
+- **The clock is injected.** Backoffs are tested by moving the clock, not by waiting or editing the database.
+- **The real entry points are driven:** `start()` (boot recovery, the boot sweep, the periodic sweep) and `stop()` (the drain), not the functions they call.
 
 The soak test runs the server as a separate process against a fake store with the same API shapes as the challenge harness. It sends a few hundred sign-ups, restocks (30% delivered twice, concurrently), sell-outs, phantom restocks and bad-secret webhooks, fails 15% of email sends and 5% of stock checks, and kills the app with `SIGKILL` halfway through. It then checks that no request was emailed twice, every notified request has exactly one accepted email, and nobody is left waiting for a product that's in stock (other than sends still in their retry backoff).
 

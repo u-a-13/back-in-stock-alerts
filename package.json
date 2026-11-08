@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
-    "soak": "node --disable-warning=ExperimentalWarning test/soak.js"
+    "soak": "node --disable-warning=ExperimentalWarning test/soak.js",
+    "mutate": "node test/mutation-driver.js"
   }
 }

@@ -21,12 +21,13 @@ function openDb(dataDir) {
     CREATE TABLE IF NOT EXISTS requests (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       email           TEXT NOT NULL,
-      sku             TEXT NOT NULL,
+      sku             TEXT NOT NULL COLLATE NOCASE,  -- SKUs match whatever their case
       status          TEXT NOT NULL DEFAULT 'waiting',  -- waiting | sending | notified | failed
       source_url      TEXT,
       created_at      TEXT NOT NULL,
       notified_at     TEXT,
       attempts        INTEGER NOT NULL DEFAULT 0,
+      owed_at         TEXT,  -- set once a confirmed restock claimed it: retries no longer re-check stock
       next_attempt_at TEXT,
       last_error      TEXT,
       email_id        TEXT
@@ -50,12 +51,13 @@ function openDb(dataDir) {
   return db;
 }
 
-const now = () => new Date().toISOString();
-
-function makeStore(db) {
+function makeStore(db, { clock = () => new Date() } = {}) {
+  const now = () => clock().toISOString();
   const s = {
+    // The partial unique index is the one guard against a second open request.
     insertRequest: db.prepare(
-      `INSERT INTO requests (email, sku, source_url, created_at) VALUES (?, ?, ?, ?)`),
+      `INSERT INTO requests (email, sku, source_url, created_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (email, sku) WHERE status IN ('waiting','sending') DO NOTHING`),
     findOpen: db.prepare(
       `SELECT * FROM requests WHERE email = ? AND sku = ? AND status IN ('waiting','sending')`),
     getRequest: db.prepare(`SELECT * FROM requests WHERE id = ?`),
@@ -65,8 +67,12 @@ function makeStore(db) {
     skusWaiting: db.prepare(
       `SELECT DISTINCT sku FROM requests WHERE status = 'waiting'
          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`),
+    dueOwed: db.prepare(
+      `SELECT id FROM requests WHERE status = 'waiting' AND owed_at IS NOT NULL
+         AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY id`),
     claim: db.prepare(
-      `UPDATE requests SET status = 'sending', attempts = attempts + 1
+      `UPDATE requests SET status = 'sending', attempts = attempts + 1,
+         owed_at = CASE WHEN ? THEN COALESCE(owed_at, ?) ELSE owed_at END
          WHERE id = ? AND status = 'waiting'`),
     markNotified: db.prepare(
       `UPDATE requests SET status = 'notified', notified_at = ?, email_id = ?, last_error = NULL
@@ -91,28 +97,23 @@ function makeStore(db) {
   return {
     db,
     now,
+    nowMs: () => clock().getTime(),
 
     // Returns { request, created }. A second request for the same open
     // (email, sku) pair returns the existing one instead of a duplicate.
     createRequest(email, sku, sourceUrl) {
-      const existing = s.findOpen.get(email, sku);
-      if (existing) return { request: existing, created: false };
-      try {
-        const r = s.insertRequest.run(email, sku, sourceUrl || null, now());
-        return { request: s.getRequest.get(r.lastInsertRowid), created: true };
-      } catch (e) {
-        // Unique index is the backstop if two inserts ever race.
-        if (/UNIQUE/i.test(String(e.message))) return { request: s.findOpen.get(email, sku), created: false };
-        throw e;
-      }
+      const r = s.insertRequest.run(email, sku, sourceUrl || null, now());
+      if (r.changes === 1) return { request: s.getRequest.get(r.lastInsertRowid), created: true };
+      return { request: s.findOpen.get(email, sku), created: false };
     },
     getRequest: (id) => s.getRequest.get(id),
     dueIdsForSku: (sku) => s.dueForSku.all(sku, now()).map((r) => r.id),
+    dueOwedIds: () => s.dueOwed.all(now()).map((r) => r.id),
     skusWithWaiting: () => s.skusWaiting.all(now()).map((r) => r.sku),
 
     // The exactly-once gate: only one caller can move a request from
-    // waiting to sending.
-    claim: (id) => s.claim.run(id).changes === 1,
+    // waiting to sending. `owed` records that a confirmed restock claimed it.
+    claim: (id, { owed = false } = {}) => s.claim.run(owed ? 1 : 0, now(), id).changes === 1,
     markNotified: (id, emailId) => s.markNotified.run(now(), emailId || null, id),
     markRetry: (id, error, retryAt) => s.markRetry.run(String(error).slice(0, 500), retryAt, id),
     markFailed: (id, error) => s.markFailed.run(String(error).slice(0, 500), id),

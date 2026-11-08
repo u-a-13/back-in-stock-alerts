@@ -13,10 +13,10 @@ class HttpError extends Error {
   }
 }
 
-async function request(url, init) {
+async function request(url, init, timeoutMs = TIMEOUT_MS) {
   let res;
   try {
-    res = await fetch(url, { ...init, signal: AbortSignal.timeout(TIMEOUT_MS) });
+    res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
   } catch (e) {
     throw new HttpError(`Network error: ${e.name === 'TimeoutError' ? 'timed out' : e.message}`);
   }
@@ -32,11 +32,11 @@ function makeStockClient({ url, key }) {
 
   return {
     // { sku, quantity, inStock, name?, price?, currency?, image? }
-    async check(sku) {
+    async check(sku, { attempts = 2, timeoutMs = TIMEOUT_MS } = {}) {
       let lastErr;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < attempts; attempt++) {
         try {
-          const { res, body } = await request(`${url}/${encodeURIComponent(sku)}`, { headers });
+          const { res, body } = await request(`${url}/${encodeURIComponent(sku)}`, { headers }, timeoutMs);
           if (!res.ok) throw new HttpError(`Stock API HTTP ${res.status}`, { status: res.status, retryable: res.status >= 500 || res.status === 429 });
           if (!body || typeof body !== 'object') throw new HttpError('Stock API returned a non-JSON body');
           const quantity = Number(body.quantity);
@@ -47,7 +47,7 @@ function makeStockClient({ url, key }) {
         } catch (e) {
           lastErr = e;
           if (e.retryable === false) break;
-          if (attempt === 0) await new Promise((r) => setTimeout(r, 400));
+          if (attempt < attempts - 1) await new Promise((r) => setTimeout(r, 400));
         }
       }
       throw lastErr;
