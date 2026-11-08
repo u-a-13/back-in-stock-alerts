@@ -11,7 +11,7 @@ COPY src ./src
 
 RUN mkdir -p /data && chown node:node /data
 USER node
-VOLUME ["/data"]
+# Data lives in /data: mount a volume there (docker run -v, or a Railway volume).
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \

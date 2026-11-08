@@ -8,7 +8,7 @@ Node 22, no npm dependencies: the built-in `http`, `fetch` and SQLite (`node:sql
 
 ```bash
 docker build -t back-in-stock .
-docker run -p 3000:3000 \
+docker run -p 3000:3000 -v back-in-stock-data:/data \
   -e STOCK_API_URL=... -e STOCK_API_KEY=... \
   -e RESEND_API_KEY=... -e RESEND_BASE_URL=... \
   -e WEBHOOK_SECRET=... \
