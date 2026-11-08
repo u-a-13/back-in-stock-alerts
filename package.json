@@ -1,0 +1,14 @@
+{
+  "name": "back-in-stock-alerts",
+  "version": "1.0.0",
+  "description": "Back-in-stock email alerts: embeddable form, stock webhooks, exactly-once emails, admin page.",
+  "private": true,
+  "license": "MIT",
+  "main": "src/server.js",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
+    "soak": "node --disable-warning=ExperimentalWarning test/soak.js"
+  }
+}
